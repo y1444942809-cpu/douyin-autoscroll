@@ -18,6 +18,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <stdlib.h>
 #import <math.h>
 
 #pragma mark - 配置
@@ -265,7 +266,7 @@ static BOOL DYForceYES(id self, SEL _cmd) {
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
         gEnabled ? @"开" : @"关",
         gClassScanned, (unsigned long)gHookedList.count, gForceCount,
-        NSStringFromClass([DYTopVC class]), hooked];
+        NSStringFromClass([DYTopVC() class]), hooked];
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自动连播 · 诊断"
                                                                message:msg
