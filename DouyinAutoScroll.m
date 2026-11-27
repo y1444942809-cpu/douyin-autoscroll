@@ -51,6 +51,17 @@ static void DYLog(NSString *fmt, ...) {
 // 原始 IMP 查询（定义在下方，此处前向声明）
 static IMP DYFindOrigIMP(Class cls, SEL sel);
 
+#pragma mark - Manager 声明（Hook 函数会用到，必须先声明）
+
+@interface DYAutoScrollManager : NSObject
++ (instancetype)sharedInstance;
+- (void)start;
+- (void)installHooks;
+- (void)videoEnded;
+- (void)performScroll;
+- (void)ensureSwitchButton;
+@end
+
 #pragma mark - 工具
 
 static BOOL DYIsTargetApp(void) {
@@ -106,7 +117,7 @@ typedef struct { Class cls; SEL sel; IMP imp; } DYOrigEntry;
 static DYOrigEntry gOrigTable[64];
 static int gOrigCount = 0;
 
-IMP DYFindOrigIMP(Class cls, SEL sel) {
+static IMP DYFindOrigIMP(Class cls, SEL sel) {
     for (int i = 0; i < gOrigCount; i++) {
         if (gOrigTable[i].cls == cls && gOrigTable[i].sel == sel) return gOrigTable[i].imp;
     }
@@ -130,16 +141,7 @@ static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
     }
 }
 
-#pragma mark - Manager
-
-@interface DYAutoScrollManager : NSObject
-+ (instancetype)sharedInstance;
-- (void)start;
-- (void)installHooks;
-- (void)videoEnded;
-- (void)performScroll;
-- (void)ensureSwitchButton;
-@end
+#pragma mark - Manager 实现
 
 @implementation DYAutoScrollManager
 
