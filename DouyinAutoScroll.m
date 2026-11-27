@@ -43,6 +43,9 @@ static NSString *gLastVC    = @"-";
 static NSString *gLastView  = @"-";
 static NSDate   *gLastFire  = nil;
 static double    gTimeAtFire = -1.0;
+static double    gLastCur    = -1.0;  // 进度回调最后一次的 current 参数
+static double    gLastDur    = -1.0;  // 进度回调最后一次的 duration 参数
+static int       gProgressCalls = 0;  // 进度回调被调用总次数
 
 #pragma mark - 工具函数
 
@@ -167,12 +170,28 @@ static IMP gOriginalProgressIMP = NULL;
 static BOOL gProgressHooked = NO;
 
 static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDuration) {
+    gLastCur = currentTime;
+    gLastDur = totalDuration;
+    gProgressCalls++;
     if (gOriginalProgressIMP) {
         ((void (*)(id, SEL, double, double))gOriginalProgressIMP)(self, _cmd, currentTime, totalDuration);
     }
     DYAutoScrollManager *m = [DYAutoScrollManager sharedInstance];
-    if (currentTime < 1.0) m.armed = YES;
-    if (m.armed && totalDuration > 0.5 && currentTime >= totalDuration - kEndTolerance) {
+
+    // 兼容三种可能的参数语义：秒、毫秒、0~1 比例
+    BOOL nearEnd = NO;
+    if (totalDuration > 1.5 && currentTime >= totalDuration - kEndTolerance) {
+        nearEnd = YES;                                  // 秒
+    } else if (totalDuration > 1000.0 && currentTime >= totalDuration - 400.0) {
+        nearEnd = YES;                                  // 毫秒
+    } else if (currentTime >= 0.97 && currentTime <= 1.5 && totalDuration <= 1.5) {
+        nearEnd = YES;                                  // 0~1 比例
+    }
+
+    // 时间看起来"回到开头"就重新武装（同样兼容三种单位）
+    if (currentTime < 1.0 || currentTime < totalDuration * 0.05) m.armed = YES;
+
+    if (m.armed && nearEnd) {
         m.armed = NO;
         [m videoReachedEnd];
     }
@@ -400,7 +419,8 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
     NSString *msg = [NSString stringWithFormat:
         @"Bundle：%@\n"
         "开关：%@\n"
-        "进度Hook：%@\n"
+        "进度Hook：%@（调用 %d 次）\n"
+        "最后进度：cur=%.2f dur=%.2f\n"
         "结束通知：%d 次\n"
         "轮询命中：%d 次\n"
         "触发上滑：%d 次\n"
@@ -411,7 +431,8 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
         "上次触发：%@",
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
         self.enabled ? @"开" : @"关",
-        gHookOK ? @"成功" : @"未装上",
+        gHookOK ? @"成功" : @"未装上", gProgressCalls,
+        gLastCur, gLastDur,
         gNotifCount, gPollHit, gEndCount, gSwipeCount, gFallback,
         gLastVC, gLastView, age];
 
@@ -419,6 +440,14 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"测试手动上滑" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        // 延迟 1 秒等弹窗关闭后执行，直接验证手势翻页是否管用
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self doScroll];
+        });
+    }]];
     UIViewController *top = DYTopViewController();
     if (top.presentedViewController == nil) {
         [top presentViewController:ac animated:YES completion:nil];
