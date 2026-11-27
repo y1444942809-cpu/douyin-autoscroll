@@ -1,15 +1,17 @@
 //
-//  DouyinAutoScroll V4 —— 读播放进度条判定播完 + Hook 播放器 KVO
+//  DouyinAutoScroll V5 —— 观察进度条 UIView 判定播完
 //
 //  演进：
-//   V1 自己检测 AVPlayer + 改 contentOffset  →  37.9.0 不走标准 AVPlayer，失败
-//   V2 模拟上滑手势 sendEvent                →  iOS15 伪造 UITouch 失效，失败
-//   V3 强制打开抖音原生"自动连播"开关        →  推荐页无此开关，206 命中全是无关类，失败
-//   V4 直接读进度条 applyWidthPercentToSubviews: 的百分比（UI 事实），
-//      到 100% 视为播完并上滑；同时 Hook 播放器 KVO 记录 keyPath 供诊断。
+//   V1 检测 AVPlayer + 改 contentOffset   → 37.9.0 不走标准 AVPlayer，失败
+//   V2 模拟上滑手势 sendEvent            → iOS15 伪造 UITouch 失效，失败
+//   V3 强制打开原生"自动连播"开关        → 推荐页无此开关，失败
+//   V4 Hook 进度方法 applyWidthPercent   → 37.9.0 无此方法，失败
+//   V5 纯 UI 观察：定时扫描视图树里的进度条 UIView，
+//      读它的宽度比例（含 frame/transform/CAShapeLayer.strokeEnd），
+//      比例到顶即视为播完。翻页用已验证有效的 contentOffset 方案。
 //
-//  长按开关弹出诊断面板：显示进度条/Hook 是否装上、进度调用次数、最后百分比、
-//  KVO keyPath、最近事件，以及"测试上滑"按钮。
+//  诊断面板：显示找到的进度视图数量、实时进度、视图类名和数值，
+//            以及"测试上滑"按钮（已验证可用）。
 //
 
 #import <Foundation/Foundation.h>
@@ -24,20 +26,21 @@
 static NSString *const kEnabledKey = @"com.douyin.autoscroll.enabled";
 static const NSInteger kSwitchTag = 887712;
 static const NSTimeInterval kCooldown = 1.5;
+static const NSTimeInterval kCheckInterval = 0.10;
+static const double kEndThreshold = 0.96;   // 进度到多少算播完
 
 #pragma mark - 全局状态
 
 static BOOL gEnabled = YES;
 static BOOL gArmed = YES;
 static NSTimeInterval gLastFire = 0;
-static int gProgressCalls = 0;
 static double gLastPercent = -1.0;
-static int gKvoCalls = 0;
-static NSString *gLastKeyPath = @"-";
+static double gPrevPercent = -1.0;
+static int gProgressViews = 0;
 static int gScrollCount = 0;
-static int gFallbackCount = 0;
-static int gProgressHooks = 0;      // 成功 hook 的进度方法数
+static NSString *gProgressInfo = @"-";
 static NSMutableArray<NSString *> *gEvents = nil;
+static NSTimer *gCheckTimer = nil;
 
 static void DYLog(NSString *fmt, ...) {
     if (!gEvents) return;
@@ -48,15 +51,12 @@ static void DYLog(NSString *fmt, ...) {
     if (gEvents.count > 14) [gEvents removeObjectAtIndex:0];
 }
 
-// 原始 IMP 查询（定义在下方，此处前向声明）
-static IMP DYFindOrigIMP(Class cls, SEL sel);
-
-#pragma mark - Manager 声明（Hook 函数会用到，必须先声明）
+#pragma mark - Manager 声明（定时器回调会用，必须先声明）
 
 @interface DYAutoScrollManager : NSObject
 + (instancetype)sharedInstance;
 - (void)start;
-- (void)installHooks;
+- (void)checkProgress:(NSTimer *)timer;
 - (void)videoEnded;
 - (void)performScroll;
 - (void)ensureSwitchButton;
@@ -81,64 +81,48 @@ static UIViewController *DYTopVC(void) {
     return vc;
 }
 
-#pragma mark - Hook 实现
-
-// 进度条百分比：0→1，到 1 即视频播完
-static void DYApplyWidthHook(id self, SEL _cmd, CGFloat percent) {
-    // 调用原实现
-    IMP realOrig = DYFindOrigIMP([self class], sel_registerName("applyWidthPercentToSubviews:"));
-    if (realOrig && realOrig != (IMP)DYApplyWidthHook) {
-        ((void (*)(id, SEL, CGFloat))realOrig)(self, _cmd, percent);
+// 递归收集名字里含 Progress/Slider 的视图
+static void DYCollectProgressViews(UIView *view, NSMutableArray<UIView *> *out) {
+    NSString *name = NSStringFromClass([view class]);
+    if ([name rangeOfString:@"Progress"].location != NSNotFound ||
+        [name rangeOfString:@"Slider"].location != NSNotFound) {
+        [out addObject:view];
     }
-
-    gProgressCalls++;
-    gLastPercent = percent;
-    if (percent < 0.05) gArmed = YES;
-    if (gArmed && percent >= 0.99) {
-        gArmed = NO;
-        DYAutoScrollManager *m = [DYAutoScrollManager sharedInstance];
-        [m videoEnded];
-    }
+    for (UIView *sub in view.subviews) DYCollectProgressViews(sub, out);
 }
 
-// 播放器 KVO：只记录 keyPath 供诊断
-static void DYKVOHook(id self, SEL _cmd, NSString *keyPath, id object, NSDictionary *change, void *context) {
-    IMP realOrig = DYFindOrigIMP([self class], sel_registerName("observeValueForKeyPath:ofObject:change:context:"));
-    if (realOrig && realOrig != (IMP)DYKVOHook) {
-        ((void (*)(id, SEL, NSString *, id, NSDictionary *, void *))realOrig)(self, _cmd, keyPath, object, change, context);
-    }
-    gKvoCalls++;
-    gLastKeyPath = keyPath ?: @"?";
-    if (gKvoCalls <= 30) DYLog(@"KVO:%@=%@", keyPath, [change objectForKey:NSKeyValueChangeNewKey]);
-}
+// 从进度条视图里读出 0~1 的进度值
+static double DYReadProgress(UIView *slider) {
+    double best = -1.0;
+    CGFloat total = slider.bounds.size.width;
 
-// 原始 IMP 映射表（每个被 hook 的类各存一份）
-typedef struct { Class cls; SEL sel; IMP imp; } DYOrigEntry;
-static DYOrigEntry gOrigTable[64];
-static int gOrigCount = 0;
-
-static IMP DYFindOrigIMP(Class cls, SEL sel) {
-    for (int i = 0; i < gOrigCount; i++) {
-        if (gOrigTable[i].cls == cls && gOrigTable[i].sel == sel) return gOrigTable[i].imp;
-    }
-    // 沿父类找
-    Class sup = class_getSuperclass(cls);
-    while (sup) {
-        for (int i = 0; i < gOrigCount; i++) {
-            if (gOrigTable[i].cls == sup && gOrigTable[i].sel == sel) return gOrigTable[i].imp;
+    // 1) 子视图里的填充条：宽度比例
+    for (UIView *sub in slider.subviews) {
+        CGFloat w = sub.frame.size.width;
+        if (w > 0 && total > 0 && w <= total + 1.0) {
+            double r = (double)w / (double)total;
+            if (r > best) best = r;
         }
-        sup = class_getSuperclass(sup);
+        // 2) transform.scale.x
+        double sx = sub.transform.a;
+        if (sx > 0 && sx <= 1.05 && sx > best) best = sx;
+        // 3) CAShapeLayer.strokeEnd
+        if ([sub.layer isKindOfClass:[CAShapeLayer class]]) {
+            double se = ((CAShapeLayer *)sub.layer).strokeEnd;
+            if (se > 0 && se <= 1.0 && se > best) best = se;
+        }
     }
-    return NULL;
-}
-
-static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
-    if (gOrigCount < 64) {
-        gOrigTable[gOrigCount].cls = cls;
-        gOrigTable[gOrigCount].sel = sel;
-        gOrigTable[gOrigCount].imp = imp;
-        gOrigCount++;
+    // 4) 视图自身宽度相对父视图
+    UIView *sup = slider.superview;
+    if (best < 0 && sup && sup.bounds.size.width > 0 && total > 0) {
+        double r = (double)total / (double)sup.bounds.size.width;
+        if (r > 0 && r <= 1.05) best = r;
     }
+    // 5) 视图自身 transform
+    if (best < 0 && slider.transform.a > 0 && slider.transform.a <= 1.05) {
+        best = slider.transform.a;
+    }
+    return best;
 }
 
 #pragma mark - Manager 实现
@@ -168,67 +152,64 @@ static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
 }
 
 - (void)start {
-    [self installHooks];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(appActive:)
                                                  name:UIApplicationDidBecomeActiveNotification
                                                object:nil];
+    if (!gCheckTimer) {
+        gCheckTimer = [NSTimer timerWithTimeInterval:kCheckInterval
+                                             target:self
+                                           selector:@selector(checkProgress:)
+                                           userInfo:nil
+                                            repeats:YES];
+        [[NSRunLoop mainRunLoop] addTimer:gCheckTimer forMode:NSRunLoopCommonModes];
+    }
     [self ensureSwitchButton];
+    DYLog(@"启动完成");
 }
 
 - (void)appActive:(NSNotification *)note {
-    [self installHooks];
     [self ensureSwitchButton];
 }
 
-- (void)installHooks {
-    if (gProgressHooks > 0) return;  // 已扫过
+- (void)checkProgress:(NSTimer *)timer {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
 
-    int count = objc_getClassList(NULL, 0);
-    if (count <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * count);
-    objc_getClassList(classes, count);
+    NSMutableArray<UIView *> *views = [NSMutableArray array];
+    DYCollectProgressViews(win, views);
+    gProgressViews = (int)views.count;
 
-    SEL progressSel = sel_registerName("applyWidthPercentToSubviews:");
-    SEL kvoSel = sel_registerName("observeValueForKeyPath:ofObject:change:context:");
-
-    for (int i = 0; i < count; i++) {
-        Class cls = classes[i];
-        NSString *name = NSStringFromClass(cls);
-        if (!name || ![name hasPrefix:@"AWE"]) continue;
-
-        // 1) 进度方法：凡 AWE 类里有 applyWidthPercentToSubviews: 就 hook
-        Method pm = class_getInstanceMethod(cls, progressSel);
-        if (pm) {
-            char *arg = method_copyArgumentType(pm, 2);
-            BOOL ok = arg && (arg[0] == 'd' || arg[0] == 'f');
-            free(arg);
-            if (ok) {
-                IMP orig = method_getImplementation(pm);
-                if (orig != (IMP)DYApplyWidthHook) {
-                    DYStoreOrig(cls, progressSel, orig);
-                    class_replaceMethod(cls, progressSel, (IMP)DYApplyWidthHook, method_getTypeEncoding(pm));
-                    gProgressHooks++;
-                    DYLog(@"进度Hook:%@", name);
-                }
-            }
-        }
-
-        // 2) 播放器 KVO：只 hook AWEAwemePlayVideoViewController
-        if ([name isEqualToString:@"AWEAwemePlayVideoViewController"]) {
-            Method km = class_getInstanceMethod(cls, kvoSel);
-            if (km) {
-                IMP orig = method_getImplementation(km);
-                if (orig != (IMP)DYKVOHook) {
-                    DYStoreOrig(cls, kvoSel, orig);
-                    class_replaceMethod(cls, kvoSel, (IMP)DYKVOHook, method_getTypeEncoding(km));
-                    DYLog(@"KVO Hook:%@", name);
-                }
-            }
+    // 取所有候选里最大的进度值
+    double maxP = -1.0;
+    NSMutableArray<NSString *> *info = [NSMutableArray array];
+    for (UIView *v in views) {
+        double p = DYReadProgress(v);
+        NSString *cls = NSStringFromClass([v class]);
+        if (p >= 0) {
+            [info addObject:[NSString stringWithFormat:@"%@:%.2f", cls, p]];
+            if (p > maxP) maxP = p;
+        } else {
+            [info addObject:[NSString stringWithFormat:@"%@:?", cls]];
         }
     }
-    free(classes);
-    if (gProgressHooks == 0) DYLog(@"!! 未找到任何进度方法");
+    gProgressInfo = info.count ? [info componentsJoinedByString:@" "] : @"未找到进度视图";
+
+    if (maxP < 0) return;
+    gPrevPercent = gLastPercent;
+    gLastPercent = maxP;
+
+    if (!gEnabled) return;
+
+    // 进度回到开头 -> 重新武装（新视频开始）
+    if (maxP < 0.08) {
+        gArmed = YES;
+    }
+    // 进度到顶 -> 播完
+    if (gArmed && maxP >= kEndThreshold) {
+        gArmed = NO;
+        [self videoEnded];
+    }
 }
 
 - (void)videoEnded {
@@ -236,7 +217,7 @@ static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - gLastFire < kCooldown) return;
     gLastFire = now;
-    DYLog(@">>>触发上滑 %.2f", gLastPercent);
+    DYLog(@">>>播完触发 %.2f", gLastPercent);
     dispatch_async(dispatch_get_main_queue(), ^{ [self performScroll]; });
 }
 
@@ -259,7 +240,6 @@ static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
         CGFloat targetY = MIN(sv.contentOffset.y + page, maxY);
         if (targetY > sv.contentOffset.y + 2.0) {
             [sv setContentOffset:CGPointMake(sv.contentOffset.x, targetY) animated:YES];
-            gFallbackCount++;
             DYLog(@"上滑执行 page=%.0f", page);
             return;
         }
@@ -323,15 +303,15 @@ static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
 - (void)showDiagnostics:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
     NSString *events = gEvents.count ? [gEvents componentsJoinedByString:@"\n"] : @"（暂无事件）";
+    NSString *pinfo = gProgressInfo.length > 180 ? [gProgressInfo substringToIndex:180] : gProgressInfo;
     NSString *msg = [NSString stringWithFormat:
         @"Bundle：%@\n开关：%@\n"
-        "进度Hook数：%d\n进度调用：%d 次\n"
-        "最后进度：%.3f\nKVO调用：%d 次\n"
-        "最后keyPath：%@\n触发：%d 上滑：%d\n"
-        "页面：%@\n\n【最近事件】\n%@",
+        "进度视图：%d 个\n当前进度：%.2f → %.2f\n"
+        "触发：%d 上滑：%d\n页面：%@\n"
+        "【进度详情】%@\n\n【最近事件】\n%@",
         [[NSBundle mainBundle] bundleIdentifier] ?: @"?", gEnabled ? @"开" : @"关",
-        gProgressHooks, gProgressCalls, gLastPercent, gKvoCalls, gLastKeyPath,
-        gScrollCount, gFallbackCount, NSStringFromClass([DYTopVC() class]), events];
+        gProgressViews, gPrevPercent, gLastPercent,
+        gScrollCount, gScrollCount, NSStringFromClass([DYTopVC() class]), pinfo, events];
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自动滑 · 诊断"
                                                                message:msg
