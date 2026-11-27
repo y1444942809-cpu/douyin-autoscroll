@@ -58,6 +58,7 @@ TrollFools 会自动处理签名和 CydiaSubstrate，本插件本身不依赖任
   - 绿色 `自动滑 ▮` = 已开启
   - 灰色 `自动滑 ○` = 已关闭
 - 点一下即可切换，状态写入 `NSUserDefaults`，下次打开抖音保持上次设置。
+- **长按开关 1 秒**会弹出「诊断」面板，显示：Bundle ID、进度 Hook 是否装上、结束通知/轮询/触发/上滑各触发了多少次、当前页面类名、全屏滚动容器数量、上次触发时间。**插件没效果时先看这个面板**，把内容截图发出来就能定位问题在哪一环。
 - 高级用法：把 `DouyinAutoScroll.plist.example` 改名为 `DouyinAutoScroll.plist`，把 `Enabled` 改成 `false`，放到抖音 App 的 `Documents` 目录（可用 Filza），plist 里的值会覆盖开关状态。
 
 ---
@@ -66,10 +67,11 @@ TrollFools 会自动处理签名和 CydiaSubstrate，本插件本身不依赖任
 
 | 模块 | 做法 |
 |---|---|
-| 播放结束检测 | ① `AVPlayerItemDidPlayToEndTimeNotification`；② 每 0.25 秒轮询视图树里的 `AVPlayerLayer`，`currentTime ≥ duration - 0.3s` 判定结束；③ Hook `AWEPlayInteractionProgressController` 的 `-updateProgressSliderWithTime:totalDuration:`，到结尾时触发 |
-| 防重复 | 1.2 秒冷却 + 每次播放需先“复位”（时间回到 <1 秒）才能再次触发 |
-| 上滑 | 在 `AWEFeedTableViewController` 等 Feed 页面里找到全屏 `UICollectionView`/`UIScrollView`，按一屏高度设置 `contentOffset`；非分页模式改用 `scrollToItemAtIndexPath:` |
-| 适用范围 | 只在 Bundle ID 含 `Aweme` 的 App 里生效，且只在推荐流/视频详情页触发，避开直播间 |
+| 播放结束检测 | ① `AVPlayerItemDidPlayToEndTimeNotification`；② 每 0.2 秒轮询视图树里的 `AVPlayerLayer`，`currentTime ≥ duration - 0.4s` 判定结束；③ Hook `AWEPlayInteractionProgressController` 的 `-updateProgressSliderWithTime:totalDuration:` |
+| 防重复 | 1.5 秒冷却 + 每次播放需先“复位”（时间回到 <1 秒）才能再次触发 |
+| 上滑（主方案） | **模拟真实上滑手势**：构造 `UITouch` + `UIEvent` 经 `sendEvent:` 派发，让抖音自己的手势识别器翻页。这样推荐页、个人主页都走同一套原生通道，不依赖会随版本失效的内部开关（DYYY 的自动连播只 hook 了个人主页的类 `AWEAwemeDetailTableViewController`，所以推荐页无效） |
+| 上滑（兜底） | 若 0.45 秒后播放时间没变，再找到全屏滚动容器改 `contentOffset` |
+| 适用范围 | 只在 Bundle ID 含 `Aweme` 的 App 里生效，App 在前台时工作，不再依赖脆弱的 VC 类名判断（抖音用自研 `AWENormalModeTabBar`，不是标准 `UITabBarController`） |
 
 源码顶部有一批可调常量（`kEndTolerance`、`kScrollCooldown`、`kPollInterval` 等），改完重新编译即可。
 

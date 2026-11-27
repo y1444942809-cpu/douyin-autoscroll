@@ -1,16 +1,20 @@
 //
-//  DouyinAutoScroll.m
-//  抖音播放完毕自动上滑下一个视频 —— 巨魔 TrollFools 注入用动态库
+//  DouyinAutoScrollV2.m
+//  抖音播放完毕自动上滑 —— 重写版
 //
-//  目标：iOS 15.4.1 / 抖音 37.9.0 (com.ss.iphone.ugc.Aweme)
-//  产物：DouyinAutoScroll.dylib （单文件，无需 Substrate/Substitute 依赖）
+//  V1 失效的两个根本原因：
+//   1) DYOnMainFeed 依赖 DYTopViewController 沿 UITabBarController 找顶层 VC，
+//      而抖音用的是自研 TabBar（AWENormalModeTabBar : UIView），
+//      顶层 VC 名字不含 Feed/AwemeDetail → 判断永远 NO → 检测逻辑整个被跳过。
+//   2) AWEFeedTableView 在抖音头文件里是 UIView 子类，不是 UIScrollView，
+//      直接改 contentOffset 很可能不触发抖音自己的翻页逻辑。
 //
-//  检测播放结束采用三重保险：
-//   1) AVPlayerItemDidPlayToEndTimeNotification
-//   2) 轮询视图树里的 AVPlayerLayer，currentTime 接近 duration
-//   3) Hook 抖音进度回调 AWEPlayInteractionProgressController
-//      -updateProgressSliderWithTime:totalDuration:
-//  任意一路命中即触发一次上滑，带冷却时间防止重复触发。
+//  V2 对策：
+//   - 去掉脆弱的 VC 类名判断，改为"App 在前台 + 有全屏视频视图"即工作。
+//   - 主动模拟真实的"上滑手势"（UITouch + UIEvent + sendEvent），
+//     让抖音自己的手势识别器翻页，而不是硬改 contentOffset。
+//   - 若手势未翻页，再回退到 contentOffset / scrollToItem。
+//   - 内置诊断面板：长按左上角开关 1 秒弹出，可看到每一步状态。
 //
 
 #import <Foundation/Foundation.h>
@@ -19,79 +23,128 @@
 #import <objc/runtime.h>
 #import <math.h>
 
-#pragma mark - 可调参数（按需修改后重新编译）
+#pragma mark - 可调参数
 
-// 距离视频结尾多少秒判定为“播放完毕”
-static const NSTimeInterval kEndTolerance = 0.30;
-// 两次自动上滑之间的最小间隔，防止连续触发
-static const NSTimeInterval kScrollCooldown = 1.20;
-// AVPlayerLayer 轮询周期
-static const NSTimeInterval kPollInterval = 0.25;
-// 当 ListView 不是分页模式时，改用 scrollToItem 翻页
-static const BOOL kUseScrollToItemFallback = YES;
-// 是否显示左上角悬浮总开关
-static const BOOL kShowFloatingSwitch = YES;
-// 开关状态持久化 key
+static const NSTimeInterval kEndTolerance   = 0.40;   // 距结尾多少秒算播完
+static const NSTimeInterval kScrollCooldown = 1.50;   // 两次上滑最小间隔
+static const NSTimeInterval kPollInterval   = 0.20;   // 轮询周期
 static NSString *const kEnabledKey = @"com.douyin.autoscroll.enabled";
-// 悬浮按钮 tag，避免重复添加
 static const NSInteger kSwitchTag = 887712;
+
+#pragma mark - 诊断计数
+
+static int gHookOK      = 0;   // 进度回调 Hook 是否装上
+static int gNotifCount  = 0;   // 收到 AVPlayerItem 结束通知次数
+static int gPollHit     = 0;   // 轮询判定播完次数
+static int gEndCount    = 0;   // videoReachedEnd 调用次数
+static int gSwipeCount  = 0;   // 模拟上滑执行次数
+static int gFallback    = 0;   // contentOffset 兜底次数
+static NSString *gLastVC    = @"-";
+static NSString *gLastView  = @"-";
+static NSDate   *gLastFire  = nil;
+static double    gTimeAtFire = -1.0;
 
 #pragma mark - 工具函数
 
 static BOOL DYIsTargetApp(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
-    // com.ss.iphone.ugc.Aweme / com.ss.iphone.ugc.AwemeLite 等
     return [bid rangeOfString:@"Aweme"].location != NSNotFound;
 }
 
 static UIViewController *DYTopViewController(void) {
     UIViewController *vc = [UIApplication sharedApplication].keyWindow.rootViewController;
-    while (vc.presentedViewController) {
-        vc = vc.presentedViewController;
+    while (vc.presentedViewController) vc = vc.presentedViewController;
+    if ([vc isKindOfClass:[UITabBarController class]] && [(UITabBarController *)vc selectedViewController]) {
+        vc = [(UITabBarController *)vc selectedViewController];
     }
-    if ([vc isKindOfClass:[UITabBarController class]]) {
-        UIViewController *selected = [(UITabBarController *)vc selectedViewController];
-        if (selected) vc = selected;
-    }
-    if ([vc isKindOfClass:[UINavigationController class]]) {
-        UIViewController *top = [(UINavigationController *)vc topViewController];
-        if (top) vc = top;
+    if ([vc isKindOfClass:[UINavigationController class]] && [(UINavigationController *)vc topViewController]) {
+        vc = [(UINavigationController *)vc topViewController];
     }
     return vc;
 }
 
-// 仅在推荐流/视频详情页触发，避开直播间等场景
-static BOOL DYOnMainFeed(void) {
-    UIViewController *vc = DYTopViewController();
-    NSString *name = NSStringFromClass([vc class]);
-    if ([name rangeOfString:@"Live"].location != NSNotFound) return NO;
-    if ([name rangeOfString:@"Feed"].location != NSNotFound) return YES;
-    if ([name rangeOfString:@"AwemeDetail"].location != NSNotFound) return YES;
-    return NO;
+static void DYCollectPlayerLayers(CALayer *layer, NSMutableArray<AVPlayerLayer *> *out) {
+    if ([layer isKindOfClass:[AVPlayerLayer class]]) [out addObject:(AVPlayerLayer *)layer];
+    for (CALayer *sub in layer.sublayers) DYCollectPlayerLayers(sub, out);
 }
 
-static void DYCollectScrollViews(UIView *view, NSMutableArray<UIScrollView *> *out) {
+static AVPlayer *DYActivePlayer(void) {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return nil;
+    NSMutableArray<AVPlayerLayer *> *layers = [NSMutableArray array];
+    DYCollectPlayerLayers(win.layer, layers);
+    AVPlayer *candidate = nil;
+    for (AVPlayerLayer *pl in layers) {
+        AVPlayer *p = pl.player;
+        if (!p || !p.currentItem) continue;
+        if (p.rate > 0.0) return p;                 // 正在播放的就是它
+        if (!candidate && CMTimeGetSeconds(p.currentTime) > 0.5) candidate = p;
+    }
+    return candidate;
+}
+
+static void DYCollectFullscreenScrollViews(UIView *view, NSMutableArray<UIScrollView *> *out) {
     if ([view isKindOfClass:[UIScrollView class]]) {
         UIScrollView *sv = (UIScrollView *)view;
         CGFloat screenH = [UIScreen mainScreen].bounds.size.height;
-        // 全屏、且内容高度大于可视高度，才可能是视频流
-        if (sv.bounds.size.height >= screenH * 0.72 &&
+        if (sv.bounds.size.height >= screenH * 0.70 &&
             sv.contentSize.height > sv.bounds.size.height + 2.0) {
             [out addObject:sv];
         }
     }
-    for (UIView *subview in view.subviews) {
-        DYCollectScrollViews(subview, out);
-    }
+    for (UIView *sub in view.subviews) DYCollectFullscreenScrollViews(sub, out);
 }
 
-static void DYCollectPlayerLayers(CALayer *layer, NSMutableArray<AVPlayerLayer *> *out) {
-    if ([layer isKindOfClass:[AVPlayerLayer class]]) {
-        [out addObject:(AVPlayerLayer *)layer];
+#pragma mark - 模拟真实上滑手势
+
+static void DYSimulateSwipeUp(UIView *view) {
+    if (!view || !view.window) return;
+
+    CGFloat w = view.bounds.size.width;
+    CGFloat h = view.bounds.size.height;
+    CGFloat cx = w / 2.0;
+
+    // 从屏幕中下部滑到中上部 —— 视频画面区域，避开右侧点赞栏和顶部标题
+    NSArray *points = @[
+        [NSValue valueWithCGPoint:CGPointMake(cx, h * 0.76)],
+        [NSValue valueWithCGPoint:CGPointMake(cx, h * 0.68)],
+        [NSValue valueWithCGPoint:CGPointMake(cx, h * 0.58)],
+        [NSValue valueWithCGPoint:CGPointMake(cx, h * 0.46)],
+        [NSValue valueWithCGPoint:CGPointMake(cx, h * 0.34)],
+        [NSValue valueWithCGPoint:CGPointMake(cx, h * 0.28)]
+    ];
+    // UITouchPhase: Began=0, Moved=1, Stationary=2, Ended=3, Cancelled=4
+    NSArray *phases = @[@0, @1, @1, @1, @1, @3];
+
+    NSTimeInterval base = [[NSDate date] timeIntervalSince1970];
+
+    UITouch *touch = [[UITouch alloc] init];
+    [touch setValue:view forKey:@"_view"];
+    [touch setValue:view.window forKey:@"_window"];
+    [touch setValue:@(0) forKey:@"_tapCount"];
+    [touch setValue:@(1.0) forKey:@"_force"];
+    [touch setValue:@(base) forKey:@"_timestamp"];
+
+    UIEvent *event = [[UIEvent alloc] init];
+    [event setValue:@(0) forKey:@"_type"];                       // UIEventTypeTouches
+    [event setValue:[NSSet setWithObject:touch] forKey:@"_touches"];
+    [event setValue:@(base) forKey:@"_timestamp"];
+
+    for (NSUInteger i = 0; i < points.count; i++) {
+        CGPoint p = [(NSValue *)points[i] CGPointValue];
+        CGPoint prev = [(NSValue *)points[i == 0 ? 0 : i - 1] CGPointValue];
+        NSNumber *phase = phases[i];
+        NSTimeInterval ts = base + i * 0.02;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(i * 0.02 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [touch setValue:phase forKey:@"_phase"];
+            [touch setValue:[NSValue valueWithCGPoint:p] forKey:@"_locationInWindow"];
+            [touch setValue:[NSValue valueWithCGPoint:prev] forKey:@"_previousLocationInWindow"];
+            [touch setValue:@(ts) forKey:@"_timestamp"];
+            [[UIApplication sharedApplication] sendEvent:event];
+        });
     }
-    for (CALayer *sublayer in layer.sublayers) {
-        DYCollectPlayerLayers(sublayer, out);
-    }
+    gSwipeCount++;
 }
 
 #pragma mark - Manager 声明
@@ -108,9 +161,8 @@ static void DYCollectPlayerLayers(CALayer *layer, NSMutableArray<AVPlayerLayer *
 - (void)ensureSwitchButton;
 @end
 
-#pragma mark - Progress Hook
+#pragma mark - 进度回调 Hook
 
-// 抖音 35.x/37.x 中该方法签名为 (CGFloat, CGFloat)，arm64 下即 double
 static IMP gOriginalProgressIMP = NULL;
 static BOOL gProgressHooked = NO;
 
@@ -118,13 +170,11 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
     if (gOriginalProgressIMP) {
         ((void (*)(id, SEL, double, double))gOriginalProgressIMP)(self, _cmd, currentTime, totalDuration);
     }
-    DYAutoScrollManager *manager = [DYAutoScrollManager sharedInstance];
-    if (currentTime < 1.0) manager.armed = YES;
-    if (manager.armed &&
-        totalDuration > 0.5 &&
-        currentTime >= totalDuration - kEndTolerance) {
-        manager.armed = NO;
-        [manager videoReachedEnd];
+    DYAutoScrollManager *m = [DYAutoScrollManager sharedInstance];
+    if (currentTime < 1.0) m.armed = YES;
+    if (m.armed && totalDuration > 0.5 && currentTime >= totalDuration - kEndTolerance) {
+        m.armed = NO;
+        [m videoReachedEnd];
     }
 }
 
@@ -134,10 +184,8 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
 
 + (instancetype)sharedInstance {
     static DYAutoScrollManager *instance = nil;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        instance = [[self alloc] init];
-    });
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
     return instance;
 }
 
@@ -145,229 +193,241 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
     self = [super init];
     if (self) {
         _armed = YES;
-        _enabled = [self loadEnabledState];
+        BOOL state = YES;
+        NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+        id stored = [ud objectForKey:kEnabledKey];
+        if (stored) state = [stored boolValue];
+        NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/DouyinAutoScroll.plist"];
+        NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:path];
+        if ([cfg objectForKey:@"Enabled"]) state = [cfg[@"Enabled"] boolValue];
+        _enabled = state;
     }
     return self;
-}
-
-// NSUserDefaults 为主，同时支持在 App 的 Documents 放一个 plist 覆盖设置
-- (BOOL)loadEnabledState {
-    BOOL state = YES; // 默认开启，用户可通过悬浮开关随时关闭
-    id stored = [[NSUserDefaults standardUserDefaults] objectForKey:kEnabledKey];
-    if (stored) state = [stored boolValue];
-
-    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/DouyinAutoScroll.plist"];
-    NSDictionary *fileConfig = [NSDictionary dictionaryWithContentsOfFile:path];
-    id override = [fileConfig objectForKey:@"Enabled"];
-    if (override) state = [override boolValue];
-    return state;
 }
 
 - (void)start {
     [self installHooks];
 
-    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
-    [center addObserver:self
-               selector:@selector(handlePlayerItemEnd:)
-                   name:AVPlayerItemDidPlayToEndTimeNotification
-                 object:nil];
-    [center addObserver:self
-               selector:@selector(appBecameActive:)
-                   name:UIApplicationDidBecomeActiveNotification
-                 object:nil];
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    [nc addObserver:self selector:@selector(handleItemEnd:)
+               name:AVPlayerItemDidPlayToEndTimeNotification object:nil];
+    [nc addObserver:self selector:@selector(appActive:)
+               name:UIApplicationDidBecomeActiveNotification object:nil];
 
     if (!self.pollTimer) {
-        self.pollTimer = [NSTimer timerWithTimeInterval:kPollInterval
-                                                target:self
-                                              selector:@selector(pollPlayers:)
-                                              userInfo:nil
-                                               repeats:YES];
+        self.pollTimer = [NSTimer timerWithTimeInterval:kPollInterval target:self
+                                              selector:@selector(poll:) userInfo:nil repeats:YES];
         [[NSRunLoop mainRunLoop] addTimer:self.pollTimer forMode:NSRunLoopCommonModes];
     }
     [self ensureSwitchButton];
+    // keyWindow 在某些时机还没就绪，补一次
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{ [self ensureSwitchButton]; });
 }
 
 - (void)installHooks {
     if (gProgressHooked) return;
     Class cls = objc_getClass("AWEPlayInteractionProgressController");
     if (!cls) return;
-
     SEL sel = sel_registerName("updateProgressSliderWithTime:totalDuration:");
     Method method = class_getInstanceMethod(cls, sel);
     if (!method) return;
 
-    // 参数必须是 double，签名不一致就跳过，避免破坏原逻辑
-    char *arg2 = method_copyArgumentType(method, 2);
-    char *arg3 = method_copyArgumentType(method, 3);
-    BOOL signatureOK = (arg2 && arg3 && arg2[0] == 'd' && arg3[0] == 'd');
-    free(arg2);
-    free(arg3);
-    if (!signatureOK) return;
+    char *a2 = method_copyArgumentType(method, 2);
+    char *a3 = method_copyArgumentType(method, 3);
+    BOOL ok = (a2 && a3 && a2[0] == 'd' && a3[0] == 'd');
+    free(a2); free(a3);
+    if (!ok) return;
 
     IMP original = method_getImplementation(method);
     if (!original) return;
-
     class_replaceMethod(cls, sel, (IMP)DYProgressHook, method_getTypeEncoding(method));
     gOriginalProgressIMP = original;
     gProgressHooked = YES;
+    gHookOK = 1;
 }
 
-- (void)appBecameActive:(NSNotification *)notification {
-    // 抖音切后台回来 keyWindow 可能变化，重新挂开关、补装 Hook
+- (void)appActive:(NSNotification *)note {
     [self installHooks];
     [self ensureSwitchButton];
 }
 
-- (void)handlePlayerItemEnd:(NSNotification *)notification {
+- (void)handleItemEnd:(NSNotification *)note {
+    gNotifCount++;
     if (!self.enabled) return;
-    if (!DYOnMainFeed()) return;
     self.armed = NO;
     [self videoReachedEnd];
 }
 
-- (void)pollPlayers:(NSTimer *)timer {
-    if (!self.enabled) return;
-    if (!DYOnMainFeed()) return;
+- (void)poll:(NSTimer *)timer {
+    UIViewController *vc = DYTopViewController();
+    gLastVC = NSStringFromClass([vc class]) ?: @"?";
 
-    NSMutableArray<AVPlayerLayer *> *layers = [NSMutableArray array];
-    DYCollectPlayerLayers([UIApplication sharedApplication].keyWindow.layer, layers);
-    if (layers.count == 0) return;
-
-    AVPlayer *activePlayer = nil;
-    for (AVPlayerLayer *playerLayer in layers) {
-        AVPlayer *player = playerLayer.player;
-        if (!player || !player.currentItem) continue;
-        if (player.rate > 0.0) {
-            activePlayer = player;
-            break;
-        }
-        if (!activePlayer && CMTimeGetSeconds(player.currentTime) > 0.5) {
-            activePlayer = player; // 有些版本在结尾会把 rate 置 0
-        }
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (win) {
+        NSMutableArray<UIScrollView *> *svs = [NSMutableArray array];
+        DYCollectFullscreenScrollViews(win, svs);
+        gLastView = [NSString stringWithFormat:@"%lu 个全屏滚动容器", (unsigned long)svs.count];
     }
-    if (!activePlayer) return;
 
-    CMTime current = activePlayer.currentTime;
-    CMTime duration = activePlayer.currentItem.duration;
-    if (!CMTIME_IS_VALID(current) || !CMTIME_IS_VALID(duration)) return;
+    if (!self.enabled || [UIApplication sharedApplication].applicationState != UIApplicationStateActive) return;
 
-    double t = CMTimeGetSeconds(current);
-    double d = CMTimeGetSeconds(duration);
+    AVPlayer *player = DYActivePlayer();
+    if (!player) return;
+    CMTime ct = player.currentTime;
+    CMTime dt = player.currentItem.duration;
+    if (!CMTIME_IS_VALID(ct) || !CMTIME_IS_VALID(dt)) return;
+
+    double t = CMTimeGetSeconds(ct);
+    double d = CMTimeGetSeconds(dt);
     if (isnan(t) || isnan(d)) return;
 
     if (t < 1.0) self.armed = YES;
     if (self.armed && d > 0.5 && t >= d - kEndTolerance) {
         self.armed = NO;
+        gPollHit++;
         [self videoReachedEnd];
     }
 }
 
 - (void)videoReachedEnd {
     if (!self.enabled) return;
-
     NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
     if (now - self.lastTrigger < kScrollCooldown) return;
     self.lastTrigger = now;
+    gEndCount++;
+    gLastFire = [NSDate date];
+
+    AVPlayer *p = DYActivePlayer();
+    gTimeAtFire = p ? CMTimeGetSeconds(p.currentTime) : -1.0;
 
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self scrollToNextVideo];
+        [self doScroll];
     });
 }
 
-- (void)scrollToNextVideo {
-    UIWindow *window = [UIApplication sharedApplication].keyWindow;
-    if (!window) return;
+- (void)doScroll {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
 
-    NSMutableArray<UIScrollView *> *scrollViews = [NSMutableArray array];
-    UIViewController *top = DYTopViewController();
-    if (top.view) DYCollectScrollViews(top.view, scrollViews);
-    if (scrollViews.count == 0) DYCollectScrollViews(window, scrollViews);
-    if (scrollViews.count == 0) return;
+    // 主方案：模拟真实上滑手势，交给抖音自己的手势识别器处理
+    UIView *target = DYTopViewController().view ?: win;
+    DYSimulateSwipeUp(target);
 
-    // 视频流一般是 UICollectionView，优先选它
-    UIScrollView *scrollView = nil;
-    for (UIScrollView *candidate in scrollViews) {
-        if ([candidate isKindOfClass:[UICollectionView class]]) {
-            scrollView = candidate;
-            break;
+    // 兜底：0.45 秒后如果播放时间没变（说明没翻页），改用 contentOffset
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.45 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        AVPlayer *p2 = DYActivePlayer();
+        double t2 = p2 ? CMTimeGetSeconds(p2.currentTime) : -1.0;
+        if (gTimeAtFire >= 0 && t2 >= 0 && fabs(t2 - gTimeAtFire) < 1.0) {
+            [self scrollViaContentOffset];
         }
-    }
-    if (!scrollView) scrollView = [scrollViews firstObject];
-
-    // 非分页模式：用 indexPath 精确翻到下一条
-    if (kUseScrollToItemFallback &&
-        [scrollView isKindOfClass:[UICollectionView class]] &&
-        !scrollView.pagingEnabled) {
-        UICollectionView *collectionView = (UICollectionView *)scrollView;
-        NSIndexPath *visible = collectionView.indexPathsForVisibleItems.firstObject;
-        if (visible) {
-            NSInteger nextItem = visible.item + 1;
-            if (nextItem < [collectionView numberOfItemsInSection:visible.section]) {
-                NSIndexPath *nextPath = [NSIndexPath indexPathForItem:nextItem
-                                                            inSection:visible.section];
-                [collectionView scrollToItemAtIndexPath:nextPath
-                                       atScrollPosition:UICollectionViewScrollPositionTop
-                                               animated:YES];
-                return;
-            }
-        }
-    }
-
-    // 分页模式：按一屏高度上滑
-    CGFloat pageHeight = scrollView.bounds.size.height;
-    CGFloat maxOffsetY = scrollView.contentSize.height - scrollView.bounds.size.height;
-    CGFloat targetY = MIN(scrollView.contentOffset.y + pageHeight, maxOffsetY);
-    if (targetY <= scrollView.contentOffset.y + 2.0) return; // 已经到底，交给抖音加载更多
-    [scrollView setContentOffset:CGPointMake(scrollView.contentOffset.x, targetY) animated:YES];
+    });
 }
 
-#pragma mark - 悬浮总开关
+- (void)scrollViaContentOffset {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+    NSMutableArray<UIScrollView *> *svs = [NSMutableArray array];
+    DYCollectFullscreenScrollViews(win, svs);
+    if (svs.count == 0) return;
+
+    UIScrollView *sv = nil;
+    for (UIScrollView *c in svs) {
+        if ([c isKindOfClass:[UICollectionView class]]) { sv = c; break; }
+    }
+    if (!sv) sv = svs.firstObject;
+
+    CGFloat page = sv.bounds.size.height;
+    CGFloat maxY = sv.contentSize.height - sv.bounds.size.height;
+    CGFloat targetY = MIN(sv.contentOffset.y + page, maxY);
+    if (targetY > sv.contentOffset.y + 2.0) {
+        [sv setContentOffset:CGPointMake(sv.contentOffset.x, targetY) animated:YES];
+        gFallback++;
+    }
+}
+
+#pragma mark - 开关 + 诊断面板
 
 - (void)ensureSwitchButton {
-    if (!kShowFloatingSwitch) return;
-    UIWindow *window = [UIApplication sharedApplication].keyWindow;
-    if (!window) return;
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
 
-    UIButton *button = (UIButton *)[window viewWithTag:kSwitchTag];
-    if (!button) {
-        button = [UIButton buttonWithType:UIButtonTypeCustom];
-        button.tag = kSwitchTag;
-        button.layer.cornerRadius = 15.0;
-        button.layer.masksToBounds = YES;
-        button.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
-        [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-        [button addTarget:self
-                   action:@selector(toggleSwitch)
-         forControlEvents:UIControlEventTouchUpInside];
-        [window addSubview:button];
+    UIButton *btn = (UIButton *)[win viewWithTag:kSwitchTag];
+    if (!btn) {
+        btn = [UIButton buttonWithType:UIButtonTypeCustom];
+        btn.tag = kSwitchTag;
+        btn.layer.cornerRadius = 15.0;
+        btn.layer.masksToBounds = YES;
+        btn.titleLabel.font = [UIFont boldSystemFontOfSize:12.0];
+        [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+        [btn addTarget:self action:@selector(toggleSwitch) forControlEvents:UIControlEventTouchUpInside];
+
+        UILongPressGestureRecognizer *lp = [[UILongPressGestureRecognizer alloc]
+                                            initWithTarget:self action:@selector(showDiagnostics:)];
+        lp.minimumPressDuration = 1.0;
+        [btn addGestureRecognizer:lp];
+        [win addSubview:btn];
     }
 
-    button.frame = CGRectMake(10.0, window.safeAreaInsets.top + 8.0, 78.0, 30.0);
+    btn.frame = CGRectMake(10.0, win.safeAreaInsets.top + 8.0, 82.0, 30.0);
     if (self.enabled) {
-        [button setTitle:@"自动滑 ▮" forState:UIControlStateNormal];
-        button.backgroundColor = [[UIColor colorWithRed:0.10 green:0.72 blue:0.36 alpha:1.0]
-                                  colorWithAlphaComponent:0.72];
+        [btn setTitle:@"自动滑 ▮" forState:UIControlStateNormal];
+        btn.backgroundColor = [[UIColor colorWithRed:0.10 green:0.72 blue:0.36 alpha:1.0]
+                               colorWithAlphaComponent:0.72];
     } else {
-        [button setTitle:@"自动滑 ○" forState:UIControlStateNormal];
-        button.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.50];
+        [btn setTitle:@"自动滑 ○" forState:UIControlStateNormal];
+        btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.50];
     }
-    [window bringSubviewToFront:button];
+    [win bringSubviewToFront:btn];
 }
 
 - (void)toggleSwitch {
     self.enabled = !self.enabled;
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
-    [defaults setBool:self.enabled forKey:kEnabledKey];
-    [defaults synchronize];
+    NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
+    [ud setBool:self.enabled forKey:kEnabledKey];
+    [ud synchronize];
     self.armed = YES;
     [self ensureSwitchButton];
     [self showToast:self.enabled ? @"自动上滑：已开启" : @"自动上滑：已关闭"];
 }
 
-- (void)showToast:(NSString *)text {
-    UIWindow *window = [UIApplication sharedApplication].keyWindow;
-    if (!window) return;
+- (void)showDiagnostics:(UILongPressGestureRecognizer *)gesture {
+    if (gesture.state != UIGestureRecognizerStateBegan) return;
 
+    NSString *age = gLastFire ? [NSString stringWithFormat:@"%.0f 秒前",
+                                  -[gLastFire timeIntervalSinceNow]] : @"从未";
+    NSString *msg = [NSString stringWithFormat:
+        @"Bundle：%@\n"
+        "开关：%@\n"
+        "进度Hook：%@\n"
+        "结束通知：%d 次\n"
+        "轮询命中：%d 次\n"
+        "触发上滑：%d 次\n"
+        "模拟手势：%d 次\n"
+        "兜底滚动：%d 次\n"
+        "当前页面：%@\n"
+        "容器：%@\n"
+        "上次触发：%@",
+        [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
+        self.enabled ? @"开" : @"关",
+        gHookOK ? @"成功" : @"未装上",
+        gNotifCount, gPollHit, gEndCount, gSwipeCount, gFallback,
+        gLastVC, gLastView, age];
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自动滑 · 诊断"
+                                                               message:msg
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault handler:nil]];
+    UIViewController *top = DYTopViewController();
+    if (top.presentedViewController == nil) {
+        [top presentViewController:ac animated:YES completion:nil];
+    }
+}
+
+- (void)showToast:(NSString *)text {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
     UILabel *label = [[UILabel alloc] initWithFrame:CGRectZero];
     label.text = text;
     label.textColor = [UIColor whiteColor];
@@ -376,24 +436,15 @@ static void DYProgressHook(id self, SEL _cmd, double currentTime, double totalDu
     label.textAlignment = NSTextAlignmentCenter;
     label.layer.cornerRadius = 8.0;
     label.layer.masksToBounds = YES;
-
     CGSize fit = [label sizeThatFits:CGSizeMake(280.0, 44.0)];
-    label.frame = CGRectMake((window.bounds.size.width - fit.width - 24.0) / 2.0,
-                             window.bounds.size.height * 0.72,
-                             fit.width + 24.0,
-                             fit.height + 16.0);
+    label.frame = CGRectMake((win.bounds.size.width - fit.width - 24.0) / 2.0,
+                             win.bounds.size.height * 0.72, fit.width + 24.0, fit.height + 16.0);
     label.alpha = 0.0;
-    [window addSubview:label];
-    [window bringSubviewToFront:label];
-
-    [UIView animateWithDuration:0.2 animations:^{
-        label.alpha = 1.0;
-    } completion:^(BOOL finished) {
-        [UIView animateWithDuration:0.25
-                              delay:1.2
-                            options:0
-                         animations:^{ label.alpha = 0.0; }
-                         completion:^(BOOL done) { [label removeFromSuperview]; }];
+    [win addSubview:label];
+    [win bringSubviewToFront:label];
+    [UIView animateWithDuration:0.2 animations:^{ label.alpha = 1.0; } completion:^(BOOL f) {
+        [UIView animateWithDuration:0.25 delay:1.2 options:0 animations:^{ label.alpha = 0.0; }
+                         completion:^(BOOL d) { [label removeFromSuperview]; }];
     }];
 }
 

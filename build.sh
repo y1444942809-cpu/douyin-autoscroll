@@ -16,6 +16,9 @@ clang -target arm64-apple-ios15.0 \
   -framework UIKit \
   -framework AVFoundation \
   -framework QuartzCore \
+  -framework CoreGraphics \
+  -framework CoreMedia \
+  -Wl,-undefined,dynamic_lookup \
   -o DouyinAutoScroll.dylib \
   DouyinAutoScroll.m
 
