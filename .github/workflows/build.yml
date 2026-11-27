@@ -12,7 +12,7 @@ jobs:
       - name: Build dylib
         run: |
           SDK="$(xcrun --sdk iphoneos --show-sdk-path)"
-          clang -target arm64-apple-ios15.0 -isysroot "$SDK" -fobjc-arc -fobjc-runtime=ios-15.0 -fPIC -dynamiclib -framework Foundation -framework UIKit -framework AVFoundation -framework QuartzCore -framework CoreGraphics -o DouyinAutoScroll.dylib DouyinAutoScroll.m
+          clang -target arm64-apple-ios15.0 -isysroot "$SDK" -fobjc-arc -fobjc-runtime=ios-15.0 -fPIC -dynamiclib -framework Foundation -framework UIKit -framework AVFoundation -framework QuartzCore -framework CoreGraphics -framework CoreMedia -Wl,-undefined,dynamic_lookup -o DouyinAutoScroll.dylib DouyinAutoScroll.m
           codesign -s - --force DouyinAutoScroll.dylib
           file DouyinAutoScroll.dylib
       - name: Upload artifact
