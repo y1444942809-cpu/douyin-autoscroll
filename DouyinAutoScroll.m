@@ -1,72 +1,61 @@
 //
-//  DouyinAutoScroll V3 —— 强制开启抖音原生"自动连播"开关
+//  DouyinAutoScroll V4 —— 读播放进度条判定播完 + Hook 播放器 KVO
 //
-//  核心思路（来自 DYYY 开源项目验证）：
-//    抖音原生就有"视频播完自动播下一个"的能力，只是由若干开关控制，
-//    默认在推荐页是关的。V1/V2 自己检测播放结束 + 模拟上滑都走不通
-//    （抖音 37.9.0 不用标准 AVPlayer、伪造 UITouch 在 iOS15 失效）。
-//    V3 直接把这些开关强制返回 YES，让抖音自己完成连播。
+//  演进：
+//   V1 自己检测 AVPlayer + 改 contentOffset  →  37.9.0 不走标准 AVPlayer，失败
+//   V2 模拟上滑手势 sendEvent                →  iOS15 伪造 UITouch 失效，失败
+//   V3 强制打开抖音原生"自动连播"开关        →  推荐页无此开关，206 命中全是无关类，失败
+//   V4 直接读进度条 applyWidthPercentToSubviews: 的百分比（UI 事实），
+//      到 100% 视为播完并上滑；同时 Hook 播放器 KVO 记录 keyPath 供诊断。
 //
-//  为避免版本改名失效，V3 用运行时扫描：
-//    遍历抖音所有类，凡类名/方法名匹配"自动播放/连播"特征，
-//    且是返回 BOOL 的无参方法，就 swizzle 成返回 YES。
-//    诊断面板会列出所有命中的类和方法，方便确认。
-//
-//  总开关：开启时才强制 YES，关闭时恢复原逻辑（%orig）。
+//  长按开关弹出诊断面板：显示进度条/Hook 是否装上、进度调用次数、最后百分比、
+//  KVO keyPath、最近事件，以及"测试上滑"按钮。
 //
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <stdlib.h>
+#import <stdarg.h>
 #import <math.h>
 
 #pragma mark - 配置
 
 static NSString *const kEnabledKey = @"com.douyin.autoscroll.enabled";
 static const NSInteger kSwitchTag = 887712;
-
-// 类名关键字：命中任意一个是"可能是自动播放相关的类"
-static NSArray *DYClassKeywords(void) {
-    return @[@"AutoPlay", @"Autoplay", @"AutoPlayManager", @"PlayControl",
-             @"ModuleService", @"FeedPlay", @"PlaybackConfig", @"Continuity",
-             @"Continuous", @"AutoNext", @"PlayerConfig"];
-}
-
-// 方法名关键字：命中任意一个就强制返回 YES
-static NSArray *DYMethodKeywords(void) {
-    return @[@"autoPlay", @"AutoPlay", @"autoplay",
-             @"getFeedIphoneAutoPlayState", @"isAutoPlayOpen",
-             @"enableUserProfilePostAutoPlay", @"hasIphoneAutoPlaySwitch",
-             @"autoNext", @"AutoNext", @"continuousPlay", @"ContinuousPlay",
-             @"autoPlayNext", @"shouldAutoPlay", @"NeedAutoPlay", @"needAutoPlay",
-             @"enableAutoPlay", @"autoLoop", @"AutoLoop"];
-}
-
-// 明确要排除的（避免误伤，例如广告/直播的自动进入）
-static NSArray *DYExcludeKeywords(void) {
-    return @[@"Live", @"AD", @"Ad", @"Comment", @"Search"];
-}
+static const NSTimeInterval kCooldown = 1.5;
 
 #pragma mark - 全局状态
 
 static BOOL gEnabled = YES;
-static NSMutableArray<NSString *> *gHookedList = nil;   // 命中的"类 方法"列表
-static int gForceCount = 0;                              // 强制返回 YES 的次数
-static int gClassScanned = 0;
+static BOOL gArmed = YES;
+static NSTimeInterval gLastFire = 0;
+static int gProgressCalls = 0;
+static double gLastPercent = -1.0;
+static int gKvoCalls = 0;
+static NSString *gLastKeyPath = @"-";
+static int gScrollCount = 0;
+static int gFallbackCount = 0;
+static int gProgressHooks = 0;      // 成功 hook 的进度方法数
+static NSMutableArray<NSString *> *gEvents = nil;
+
+static void DYLog(NSString *fmt, ...) {
+    if (!gEvents) return;
+    va_list args; va_start(args, fmt);
+    NSString *line = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    [gEvents addObject:line];
+    if (gEvents.count > 14) [gEvents removeObjectAtIndex:0];
+}
+
+// 原始 IMP 查询（定义在下方，此处前向声明）
+static IMP DYFindOrigIMP(Class cls, SEL sel);
 
 #pragma mark - 工具
 
 static BOOL DYIsTargetApp(void) {
     NSString *bid = [[NSBundle mainBundle] bundleIdentifier] ?: @"";
     return [bid rangeOfString:@"Aweme"].location != NSNotFound;
-}
-
-static BOOL DYContainsAny(NSString *s, NSArray *keywords) {
-    for (NSString *k in keywords) {
-        if ([s rangeOfString:k].location != NSNotFound) return YES;
-    }
-    return NO;
 }
 
 static UIViewController *DYTopVC(void) {
@@ -81,20 +70,64 @@ static UIViewController *DYTopVC(void) {
     return vc;
 }
 
-#pragma mark - 通用 bool YES Hook
+#pragma mark - Hook 实现
 
-// 统一的替换函数：开关开时返回 YES，关时调用原实现
-static BOOL DYForceYES(id self, SEL _cmd) {
-    if (gEnabled) {
-        gForceCount++;
-        return YES;
+// 进度条百分比：0→1，到 1 即视频播完
+static void DYApplyWidthHook(id self, SEL _cmd, CGFloat percent) {
+    // 调用原实现
+    IMP realOrig = DYFindOrigIMP([self class], sel_registerName("applyWidthPercentToSubviews:"));
+    if (realOrig && realOrig != (IMP)DYApplyWidthHook) {
+        ((void (*)(id, SEL, CGFloat))realOrig)(self, _cmd, percent);
     }
-    // 关闭时尝试调用原实现
-    IMP orig = class_getMethodImplementation([self class], _cmd);
-    // 注意：这里拿到的可能是自己（已被替换），所以关闭时最安全是返回 NO 交由系统默认；
-    //     为简化，关闭状态下返回 NO，用户关掉后重启 App 即完全恢复。
-    (void)orig;
-    return NO;
+
+    gProgressCalls++;
+    gLastPercent = percent;
+    if (percent < 0.05) gArmed = YES;
+    if (gArmed && percent >= 0.99) {
+        gArmed = NO;
+        DYAutoScrollManager *m = [DYAutoScrollManager sharedInstance];
+        [m videoEnded];
+    }
+}
+
+// 播放器 KVO：只记录 keyPath 供诊断
+static void DYKVOHook(id self, SEL _cmd, NSString *keyPath, id object, NSDictionary *change, void *context) {
+    IMP realOrig = DYFindOrigIMP([self class], sel_registerName("observeValueForKeyPath:ofObject:change:context:"));
+    if (realOrig && realOrig != (IMP)DYKVOHook) {
+        ((void (*)(id, SEL, NSString *, id, NSDictionary *, void *))realOrig)(self, _cmd, keyPath, object, change, context);
+    }
+    gKvoCalls++;
+    gLastKeyPath = keyPath ?: @"?";
+    if (gKvoCalls <= 30) DYLog(@"KVO:%@=%@", keyPath, [change objectForKey:NSKeyValueChangeNewKey]);
+}
+
+// 原始 IMP 映射表（每个被 hook 的类各存一份）
+typedef struct { Class cls; SEL sel; IMP imp; } DYOrigEntry;
+static DYOrigEntry gOrigTable[64];
+static int gOrigCount = 0;
+
+IMP DYFindOrigIMP(Class cls, SEL sel) {
+    for (int i = 0; i < gOrigCount; i++) {
+        if (gOrigTable[i].cls == cls && gOrigTable[i].sel == sel) return gOrigTable[i].imp;
+    }
+    // 沿父类找
+    Class sup = class_getSuperclass(cls);
+    while (sup) {
+        for (int i = 0; i < gOrigCount; i++) {
+            if (gOrigTable[i].cls == sup && gOrigTable[i].sel == sel) return gOrigTable[i].imp;
+        }
+        sup = class_getSuperclass(sup);
+    }
+    return NULL;
+}
+
+static void DYStoreOrig(Class cls, SEL sel, IMP imp) {
+    if (gOrigCount < 64) {
+        gOrigTable[gOrigCount].cls = cls;
+        gOrigTable[gOrigCount].sel = sel;
+        gOrigTable[gOrigCount].imp = imp;
+        gOrigCount++;
+    }
 }
 
 #pragma mark - Manager
@@ -102,22 +135,25 @@ static BOOL DYForceYES(id self, SEL _cmd) {
 @interface DYAutoScrollManager : NSObject
 + (instancetype)sharedInstance;
 - (void)start;
+- (void)installHooks;
+- (void)videoEnded;
+- (void)performScroll;
 - (void)ensureSwitchButton;
-- (void)installAutoPlaySwizzles;
 @end
 
 @implementation DYAutoScrollManager
 
 + (instancetype)sharedInstance {
-    static DYAutoScrollManager *instance = nil;
+    static DYAutoScrollManager *inst = nil;
     static dispatch_once_t once;
-    dispatch_once(&once, ^{ instance = [[self alloc] init]; });
-    return instance;
+    dispatch_once(&once, ^{ inst = [[self alloc] init]; });
+    return inst;
 }
 
 - (instancetype)init {
     self = [super init];
     if (self) {
+        gEvents = [NSMutableArray array];
         gEnabled = YES;
         NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
         id stored = [ud objectForKey:kEnabledKey];
@@ -125,18 +161,12 @@ static BOOL DYForceYES(id self, SEL _cmd) {
         NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Documents/DouyinAutoScroll.plist"];
         NSDictionary *cfg = [NSDictionary dictionaryWithContentsOfFile:path];
         if ([cfg objectForKey:@"Enabled"]) gEnabled = [cfg[@"Enabled"] boolValue];
-        gHookedList = [NSMutableArray array];
     }
     return self;
 }
 
 - (void)start {
-    // 稍等片刻，等抖音的类都注册完再扫描
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [self installAutoPlaySwizzles];
-        [self ensureSwitchButton];
-    });
+    [self installHooks];
     [[NSNotificationCenter defaultCenter] addObserver:self
                                              selector:@selector(appActive:)
                                                  name:UIApplicationDidBecomeActiveNotification
@@ -145,68 +175,106 @@ static BOOL DYForceYES(id self, SEL _cmd) {
 }
 
 - (void)appActive:(NSNotification *)note {
-    [self installAutoPlaySwizzles];
+    [self installHooks];
     [self ensureSwitchButton];
 }
 
-// 运行时扫描并 swizzle 所有"自动播放"相关的 bool 无参方法
-- (void)installAutoPlaySwizzles {
-    if (gClassScanned > 0) return;  // 只扫一次，避免重复 swizzle
+- (void)installHooks {
+    if (gProgressHooks > 0) return;  // 已扫过
 
-    int classCount = objc_getClassList(NULL, 0);
-    if (classCount <= 0) return;
-    Class *classes = (Class *)malloc(sizeof(Class) * classCount);
-    objc_getClassList(classes, classCount);
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * count);
+    objc_getClassList(classes, count);
 
-    NSArray *classKW = DYClassKeywords();
-    NSArray *methodKW = DYMethodKeywords();
-    NSArray *exclude = DYExcludeKeywords();
+    SEL progressSel = sel_registerName("applyWidthPercentToSubviews:");
+    SEL kvoSel = sel_registerName("observeValueForKeyPath:ofObject:change:context:");
 
-    for (int i = 0; i < classCount; i++) {
+    for (int i = 0; i < count; i++) {
         Class cls = classes[i];
-        NSString *clsName = NSStringFromClass(cls);
-        if (!clsName) continue;
-        gClassScanned++;
+        NSString *name = NSStringFromClass(cls);
+        if (!name || ![name hasPrefix:@"AWE"]) continue;
 
-        // 只处理抖音自己的类（AWE/AWEFeed/AWEModule 等前缀），跳过系统类
-        BOOL isAwemeClass = ([clsName hasPrefix:@"AWE"] || [clsName hasPrefix:@"AWEFeed"] ||
-                             [clsName hasPrefix:@"AWEModule"] || [clsName hasPrefix:@"IES"] ||
-                             DYContainsAny(clsName, classKW));
-        if (!isAwemeClass) continue;
-        if (DYContainsAny(clsName, exclude)) continue;
-
-        // 扫描该类的方法列表（含分类方法）
-        unsigned int methodCount = 0;
-        Method *methods = class_copyMethodList(cls, &methodCount);
-        for (unsigned int j = 0; j < methodCount; j++) {
-            Method m = methods[j];
-            SEL sel = method_getName(m);
-            NSString *selName = NSStringFromSelector(sel);
-            if (!selName) continue;
-
-            // 无参方法
-            if ([selName rangeOfString:@":"].location != NSNotFound) continue;
-            // 返回类型必须是 bool/BOOL (编码 'B' 或 'c')
-            const char *ret = method_copyReturnType(m);
-            BOOL isBool = (ret && (ret[0] == 'B' || ret[0] == 'c'));
-            free((void *)ret);
-            if (!isBool) continue;
-
-            // 方法名命中自动播放关键字
-            if (!DYContainsAny(selName, methodKW)) continue;
-            if (DYContainsAny(selName, exclude)) continue;
-
-            IMP currentIMP = method_getImplementation(m);
-            if (currentIMP == (IMP)DYForceYES) continue;  // 已经 hook 过
-
-            if (class_replaceMethod(cls, sel, (IMP)DYForceYES, method_getTypeEncoding(m))) {
-                NSString *entry = [NSString stringWithFormat:@"%@ %@", clsName, selName];
-                if (![gHookedList containsObject:entry]) [gHookedList addObject:entry];
+        // 1) 进度方法：凡 AWE 类里有 applyWidthPercentToSubviews: 就 hook
+        Method pm = class_getInstanceMethod(cls, progressSel);
+        if (pm) {
+            char *arg = method_copyArgumentType(pm, 2);
+            BOOL ok = arg && (arg[0] == 'd' || arg[0] == 'f');
+            free(arg);
+            if (ok) {
+                IMP orig = method_getImplementation(pm);
+                if (orig != (IMP)DYApplyWidthHook) {
+                    DYStoreOrig(cls, progressSel, orig);
+                    class_replaceMethod(cls, progressSel, (IMP)DYApplyWidthHook, method_getTypeEncoding(pm));
+                    gProgressHooks++;
+                    DYLog(@"进度Hook:%@", name);
+                }
             }
         }
-        free(methods);
+
+        // 2) 播放器 KVO：只 hook AWEAwemePlayVideoViewController
+        if ([name isEqualToString:@"AWEAwemePlayVideoViewController"]) {
+            Method km = class_getInstanceMethod(cls, kvoSel);
+            if (km) {
+                IMP orig = method_getImplementation(km);
+                if (orig != (IMP)DYKVOHook) {
+                    DYStoreOrig(cls, kvoSel, orig);
+                    class_replaceMethod(cls, kvoSel, (IMP)DYKVOHook, method_getTypeEncoding(km));
+                    DYLog(@"KVO Hook:%@", name);
+                }
+            }
+        }
     }
     free(classes);
+    if (gProgressHooks == 0) DYLog(@"!! 未找到任何进度方法");
+}
+
+- (void)videoEnded {
+    if (!gEnabled) return;
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - gLastFire < kCooldown) return;
+    gLastFire = now;
+    DYLog(@">>>触发上滑 %.2f", gLastPercent);
+    dispatch_async(dispatch_get_main_queue(), ^{ [self performScroll]; });
+}
+
+- (void)performScroll {
+    UIWindow *win = [UIApplication sharedApplication].keyWindow;
+    if (!win) return;
+    gScrollCount++;
+
+    NSMutableArray<UIScrollView *> *svs = [NSMutableArray array];
+    [self collectScrollViews:win.layer into:svs];
+    UIScrollView *sv = nil;
+    for (UIScrollView *c in svs) {
+        if ([c isKindOfClass:[UICollectionView class]]) { sv = c; break; }
+    }
+    if (!sv) sv = svs.firstObject;
+
+    if (sv) {
+        CGFloat page = sv.bounds.size.height;
+        CGFloat maxY = sv.contentSize.height - sv.bounds.size.height;
+        CGFloat targetY = MIN(sv.contentOffset.y + page, maxY);
+        if (targetY > sv.contentOffset.y + 2.0) {
+            [sv setContentOffset:CGPointMake(sv.contentOffset.x, targetY) animated:YES];
+            gFallbackCount++;
+            DYLog(@"上滑执行 page=%.0f", page);
+            return;
+        }
+    }
+    DYLog(@"!!未找到可滚动容器");
+}
+
+- (void)collectScrollViews:(CALayer *)layer into:(NSMutableArray<UIScrollView *> *)out {
+    UIView *view = (UIView *)layer.delegate;
+    if ([view isKindOfClass:[UIScrollView class]]) {
+        UIScrollView *sv = (UIScrollView *)view;
+        CGFloat h = [UIScreen mainScreen].bounds.size.height;
+        if (sv.bounds.size.height >= h * 0.7 && sv.contentSize.height > sv.bounds.size.height + 2.0) {
+            [out addObject:sv];
+        }
+    }
+    for (CALayer *sub in layer.sublayers) [self collectScrollViews:sub into:out];
 }
 
 #pragma mark - 开关 + 诊断
@@ -232,8 +300,7 @@ static BOOL DYForceYES(id self, SEL _cmd) {
     btn.frame = CGRectMake(10.0, win.safeAreaInsets.top + 8.0, 82.0, 30.0);
     if (gEnabled) {
         [btn setTitle:@"自动滑 ▮" forState:UIControlStateNormal];
-        btn.backgroundColor = [[UIColor colorWithRed:0.10 green:0.72 blue:0.36 alpha:1.0]
-                               colorWithAlphaComponent:0.72];
+        btn.backgroundColor = [[UIColor colorWithRed:0.10 green:0.72 blue:0.36 alpha:1.0] colorWithAlphaComponent:0.72];
     } else {
         [btn setTitle:@"自动滑 ○" forState:UIControlStateNormal];
         btn.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.50];
@@ -246,36 +313,35 @@ static BOOL DYForceYES(id self, SEL _cmd) {
     NSUserDefaults *ud = [NSUserDefaults standardUserDefaults];
     [ud setBool:gEnabled forKey:kEnabledKey];
     [ud synchronize];
+    gArmed = YES;
     [self ensureSwitchButton];
-    [self showToast:gEnabled ? @"自动连播：已开启" : @"自动连播：已关闭（重启后完全恢复）"];
+    [self showToast:gEnabled ? @"自动上滑：已开启" : @"自动上滑：已关闭"];
 }
 
 - (void)showDiagnostics:(UILongPressGestureRecognizer *)gesture {
     if (gesture.state != UIGestureRecognizerStateBegan) return;
-
-    NSString *hooked = gHookedList.count ? [gHookedList componentsJoinedByString:@"\n"] : @"（无命中）";
-    if (hooked.length > 500) hooked = [[hooked substringToIndex:500] stringByAppendingString:@"\n..."];
+    NSString *events = gEvents.count ? [gEvents componentsJoinedByString:@"\n"] : @"（暂无事件）";
     NSString *msg = [NSString stringWithFormat:
-        @"Bundle：%@\n"
-        "开关：%@\n"
-        "扫描类数：%d\n"
-        "命中开关数：%lu\n"
-        "强制YES次数：%d\n"
-        "当前页面：%@\n"
-        "\n【命中的开关】\n%@",
-        [[NSBundle mainBundle] bundleIdentifier] ?: @"?",
-        gEnabled ? @"开" : @"关",
-        gClassScanned, (unsigned long)gHookedList.count, gForceCount,
-        NSStringFromClass([DYTopVC() class]), hooked];
+        @"Bundle：%@\n开关：%@\n"
+        "进度Hook数：%d\n进度调用：%d 次\n"
+        "最后进度：%.3f\nKVO调用：%d 次\n"
+        "最后keyPath：%@\n触发：%d 上滑：%d\n"
+        "页面：%@\n\n【最近事件】\n%@",
+        [[NSBundle mainBundle] bundleIdentifier] ?: @"?", gEnabled ? @"开" : @"关",
+        gProgressHooks, gProgressCalls, gLastPercent, gKvoCalls, gLastKeyPath,
+        gScrollCount, gFallbackCount, NSStringFromClass([DYTopVC() class]), events];
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自动连播 · 诊断"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"自动滑 · 诊断"
                                                                message:msg
                                                         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleDefault handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"测试上滑" style:UIAlertActionStyleDefault
+                                         handler:^(UIAlertAction *a) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.8 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self performScroll]; });
+    }]];
     UIViewController *top = DYTopVC();
-    if (top.presentedViewController == nil) {
-        [top presentViewController:ac animated:YES completion:nil];
-    }
+    if (top.presentedViewController == nil) [top presentViewController:ac animated:YES completion:nil];
 }
 
 - (void)showToast:(NSString *)text {
