@@ -41,6 +41,7 @@ static int gScrollCount = 0;
 static NSString *gProgressInfo = @"-";
 static NSMutableArray<NSString *> *gEvents = nil;
 static NSTimer *gCheckTimer = nil;
+static __weak UIScrollView *gCachedFeed = nil;   // 缓存视频流容器，播完瞬间用
 
 static void DYLog(NSString *fmt, ...) {
     if (!gEvents) return;
@@ -59,6 +60,7 @@ static void DYLog(NSString *fmt, ...) {
 - (void)checkProgress:(NSTimer *)timer;
 - (void)videoEnded;
 - (void)performScroll;
+- (void)performScrollRetry:(int)retry;
 - (void)ensureSwitchButton;
 @end
 
@@ -84,8 +86,11 @@ static UIViewController *DYTopVC(void) {
 // 递归收集名字里含 Progress/Slider 的视图
 static void DYCollectProgressViews(UIView *view, NSMutableArray<UIView *> *out) {
     NSString *name = NSStringFromClass([view class]);
-    if ([name rangeOfString:@"Progress"].location != NSNotFound ||
-        [name rangeOfString:@"Slider"].location != NSNotFound) {
+    // 排除 Story/快拍进度条（它们恒为 1.00，会干扰判断）
+    BOOL isStory = ([name rangeOfString:@"Story"].location != NSNotFound);
+    if (!isStory &&
+        ([name rangeOfString:@"Progress"].location != NSNotFound ||
+         [name rangeOfString:@"Slider"].location != NSNotFound)) {
         [out addObject:view];
     }
     for (UIView *sub in view.subviews) DYCollectProgressViews(sub, out);
@@ -176,6 +181,15 @@ static double DYReadProgress(UIView *slider) {
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
     if (!win) return;
 
+    // 界面稳定时缓存视频流容器，供播完瞬间使用
+    if (!gCachedFeed) {
+        NSMutableArray<UIScrollView *> *allSV = [NSMutableArray array];
+        [self collectScrollViews:win.layer into:allSV];
+        for (UIScrollView *c in allSV) {
+            if ([c isKindOfClass:[UICollectionView class]]) { gCachedFeed = c; break; }
+        }
+    }
+
     NSMutableArray<UIView *> *views = [NSMutableArray array];
     DYCollectProgressViews(win, views);
     gProgressViews = (int)views.count;
@@ -222,29 +236,50 @@ static double DYReadProgress(UIView *slider) {
 }
 
 - (void)performScroll {
+    [self performScrollRetry:0];
+}
+
+// 播完瞬间容器可能暂时不符合条件，用缓存 + 重试解决
+- (void)performScrollRetry:(int)retry {
     UIWindow *win = [UIApplication sharedApplication].keyWindow;
     if (!win) return;
-    gScrollCount++;
 
-    NSMutableArray<UIScrollView *> *svs = [NSMutableArray array];
-    [self collectScrollViews:win.layer into:svs];
-    UIScrollView *sv = nil;
-    for (UIScrollView *c in svs) {
-        if ([c isKindOfClass:[UICollectionView class]]) { sv = c; break; }
-    }
-    if (!sv) sv = svs.firstObject;
+    UIScrollView *sv = gCachedFeed;
 
-    if (sv) {
-        CGFloat page = sv.bounds.size.height;
-        CGFloat maxY = sv.contentSize.height - sv.bounds.size.height;
-        CGFloat targetY = MIN(sv.contentOffset.y + page, maxY);
-        if (targetY > sv.contentOffset.y + 2.0) {
-            [sv setContentOffset:CGPointMake(sv.contentOffset.x, targetY) animated:YES];
-            DYLog(@"上滑执行 page=%.0f", page);
-            return;
+    // 缓存失效（容器不在界面上了）或还没缓存，现场找
+    if (!sv || !sv.window) {
+        NSMutableArray<UIScrollView *> *svs = [NSMutableArray array];
+        [self collectScrollViews:win.layer into:svs];
+        for (UIScrollView *c in svs) {
+            if ([c isKindOfClass:[UICollectionView class]]) { sv = c; break; }
         }
+        if (!sv) sv = svs.firstObject;
     }
-    DYLog(@"!!未找到可滚动容器");
+
+    if (sv && sv.window) {
+        gCachedFeed = sv;
+        CGFloat page = sv.bounds.size.height;
+        // 放宽 contentSize 判断：播完瞬间可能还没扩展，用最大(page, 可用空间)
+        CGFloat cur = sv.contentOffset.y;
+        CGFloat maxY = sv.contentSize.height - sv.bounds.size.height;
+        if (maxY < cur + page) maxY = cur + page;   // 不依赖 contentSize
+        [sv setContentOffset:CGPointMake(sv.contentOffset.x, cur + page) animated:YES];
+        gScrollCount++;
+        gArmed = NO;
+        DYLog(@"上滑执行(重试%d) page=%.0f", retry, page);
+        return;
+    }
+
+    // 没找到，短暂重试几次
+    if (retry < 5) {
+        DYLog(@"容器缺失，重试 %d", retry + 1);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self performScrollRetry:retry + 1];
+        });
+    } else {
+        DYLog(@"!!放弃：6次都没找到容器");
+    }
 }
 
 - (void)collectScrollViews:(CALayer *)layer into:(NSMutableArray<UIScrollView *> *)out {
