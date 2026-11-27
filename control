@@ -1,0 +1,8 @@
+Package: com.douyin.autoscroll
+Name: DouyinAutoScroll
+Version: 1.0.0
+Architecture: iphoneos-arm
+Description: 抖音视频播放完毕后自动上滑播放下一个视频，带悬浮总开关
+Maintainer: WorkBuddy
+Author: WorkBuddy
+Section: Tweaks
